@@ -8,17 +8,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build both projects (Release)
 dotnet build -c Release
 
-# Publish both to the same directory (self-contained, ~67 MB)
-dotnet publish src/WebDAVService/WebDAVService.csproj -c Release -r win-x64 -o publish --self-contained
-dotnet publish src/WebDAVConfigurator/WebDAVConfigurator.csproj -c Release -r win-x64 -o publish --self-contained
+# Publish both to the same directory.
+# csproj sets SelfContained=true + PublishSingleFile=true + IncludeNativeLibrariesForSelfExtract=true,
+# so the output is just 2 exes + web/ — no dlls, no pdbs — and needs NO runtime on the target.
+# Cost: each exe bundles its own copy of the runtime (~231 MB total, they do NOT share).
+dotnet publish src/WebDAVService/WebDAVService.csproj -c Release -o publish
+dotnet publish src/WebDAVConfigurator/WebDAVConfigurator.csproj -c Release -o publish
 
-# Publish framework-dependent (requires .NET 8 runtime, ~1.1 MB)
-dotnet publish src/WebDAVService/WebDAVService.csproj -c Release -r win-x64 -o publish --no-self-contained
-dotnet publish src/WebDAVConfigurator/WebDAVConfigurator.csproj -c Release -r win-x64 -o publish --no-self-contained
+# Smaller framework-dependent variant (~4 MB, requires the .NET 8 Desktop Runtime on the target):
+#   add  -p:SelfContained=false
 
-# Deploy web templates to publish dir and service install dir
-cp src/WebDAVService/web/*.html publish/web/
-cp src/WebDAVService/web/*.html "C:/Users/41456/Desktop/easy webeav/web/"
+# `web\**` is copied by the csproj's <Content Include="web\**"> — do not cp it manually.
+# If the service is installed, redeploying means overwriting the exes in its install dir
+# (delete the stale dlls from an older folder build first) and restarting the service.
 
 # Clean
 dotnet clean
@@ -57,7 +59,8 @@ Two .NET 8 projects in one solution (`WebDAVService.sln`), zero external runtime
 - **Program.cs** — Entry point. `Host.CreateDefaultBuilder` + `UseWindowsService()` + Serilog file logging to `logs/service.log`. Target: `net8.0`.
 - **Worker.cs** — `BackgroundService`. Loads config via `WebDAVConfig.Load()`, starts `WebDAVServer`.
 - **Config.cs** — JSON config loader. Uses `JsonDocument.Parse` with hand-written field mapping (NOT `JsonSerializer.Deserialize<WebDAVConfig>`) to avoid circular-deserialization bugs. Reads `webdav_config.json` from exe directory. Static factory `Load()` + `Save()`. Also defines `UserInfo` class (duplicated in ConfigHelper.cs).
-- **WebDAVServer.cs** — Core WebDAV server via `HttpListener`. Dual auth: session cookie (browser) + Basic Auth (WebDAV clients). Handles all WebDAV methods: OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK. Read-only user enforcement. Health check timer every 20 minutes.
+- **WebDAVServer.cs** — Core WebDAV server via `HttpListener`. Dual auth: session cookie (browser) + Basic Auth (WebDAV clients). Handles all WebDAV methods: OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, COPY, MOVE, PROPPATCH, LOCK, UNLOCK, plus a SPA-only **POST = 打包下载** (streams a `ZipArchive` over a chunked response). Read-only user enforcement. Health check timer every 20 minutes.
+  - **`WWW-Authenticate` challenge is suppressed for browsers.** A `401` carries `WWW-Authenticate: Basic` only when the method is in `ChallengeMethods` **and** the request is not browser-originated (`IsBrowserRequest` = has a `Sec-Fetch-Mode`/`Sec-Fetch-Site` header). Chromium/Edge show the native Basic-auth dialog for **any** 401 + challenge — including `fetch`/XHR (verified empirically: a wrong-password PROPFIND pops the dialog) — so the SPA's own requests must get a bare `401` and let the SPA render its error. Real WebDAV clients (Explorer, rclone, Cyberduck, curl, phone apps) send no `Sec-Fetch-*`, so they still receive the challenge and authenticate. `/favicon.ico` is answered `204`.
 - **AppInfo.cs** — Shared constants (app name, version, author info). Linked as a compile-time shared file from the Configurator project.
 - **CertificateHelper.cs** — Self-signed SSL cert creation + `netsh http add sslcert` binding for HTTPS. Cert stored in LocalMachine\My store, bound to port via netsh.
 
@@ -71,10 +74,12 @@ Two .NET 8 projects in one solution (`WebDAVService.sln`), zero external runtime
 ### Web Templates (WebDAVService/web/*.html)
 Three HTML files served by `WebDAVServer`, cached in static fields with lazy loading:
 - **browse.html** — Full SPA file manager (~800 lines). Three global JS objects:
-  - `Dav` — WebDAV communication layer (PROPFIND XML parsing, fetch/XHR for all methods)
+  - `Dav` — WebDAV communication layer (PROPFIND XML parsing, fetch/XHR for all methods). `Dav.zip(urls,name)` POSTs `{"paths":[...]}` to `/` for batch download; `Dav.saveBlob()` triggers the browser download.
   - `U` — Utilities: `fico()` maps extensions to icons + hash-based HSL colors, `size()` formats bytes, `time()` formats dates
-  - `A` — App state: file list, breadcrumbs, search, selection, preview, sort. Key methods: `loadDir()`, `render()`, `toggleSort()`, `rowH()`/`gridH()` for rendering.
+  - `A` — App state: file list, breadcrumbs, search, selection, preview, sort. Key methods: `loadDir()`, `render()`, `toggleSort()`, `rowH()`/`gridH()` for rendering, `dlSel()` for batch zip download.
   Features: list/grid views, breadcrumbs, search/filter, upload progress, context menus, action sheets, drag-drop, toast notifications, file type labels (raw extension), hash-based color generation for unknown extensions, image/video preview modal. Font Awesome 6.5.0 CDN for icons.
+  - **Navigation back to root** — a home crumb (`data-bp="/"`, 根目录) in the breadcrumb plus a `#btnUp` 上一级 button (shown only when not at root, hidden label on mobile).
+  - **Batch download** — grid cells carry a `.chk` checkbox; selecting files enables `#dDl`/context-menu `dlsel`; a folder can also be "打包下载" (server zips it recursively).
 - **login.html** — Standalone login form (POST, fallback for when JS is disabled). Also supports JSON POST from SPA.
 - **logout.html** — Confirmation page with link back to `/login`.
 
@@ -87,7 +92,7 @@ Templates use `{{APP_NAME}}`, `{{AUTHOR}}`, `{{AUTHOR_URL}}`, `{{VERSION}}` plac
 - **Config sharing** — Both projects read/write `webdav_config.json` from exe directory. Service uses hand-parsed JSON (avoiding circular deserialization), Configurator uses `JsonSerializer.Deserialize<T>`. UserInfo class is duplicated in both projects.
 - **HttpListener binding** — `0.0.0.0` → `+` for HttpListener prefix (`http://+:port/`). Cert creation falls back to `localhost` when host is `+`. Binding to `+` requires admin rights. Use `localhost` to avoid admin URL ACL.
 - **SPA auth flow** — Browser GET to any directory serves the SPA template without requiring auth. All data operations (PROPFIND, MKCOL, DELETE, etc.) are made by client-side JS via Basic Auth. Login page sets a session cookie for convenience but JS uses Base64-encoded Basic Auth headers directly.
-- **Auth dispatch** — `HandleRequestAsync`: route to `/login`/`/logout` first, then check Accept header for SPA, then authenticate (session cookie > Basic Auth), then read-only check, then dispatch by HTTP method.
+- **Auth dispatch** — `HandleRequestAsync`: route to `/login`/`/logout`/`/favicon.ico` first, then check Accept header for SPA, then authenticate (session cookie > Basic Auth), then read-only check, then dispatch by HTTP method (POST → zip download). Failed auth: browser GET → `302 /login`; everything else → bare `401` (challenge only for real WebDAV clients, see above).
 - **Session management** — In-memory `ConcurrentDictionary` with 24h expiry. Logout clears session + expires cookie. Cookie header manually parsed (HttpListenerRequest.Cookies has parsing bugs).
 - **Read-only enforcement** — Per-user read-only flag checked server-side before write operations (PUT, DELETE, MKCOL, MOVE, COPY, PROPPATCH).
 - **Template caching** — Static fields with null-coalescing assignment (`_template ??= LoadWebTemplate("file.html")`). No cache invalidation — requires service restart.

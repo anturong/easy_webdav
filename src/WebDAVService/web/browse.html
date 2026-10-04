@@ -46,6 +46,8 @@
         .btn-g:hover{background:var(--bg3);color:var(--t1)}
         .btn-d{background:var(--dgd);color:var(--dg)}
         .btn-d:hover{background:var(--dg);color:#fff}
+        .btn:disabled{opacity:.45;cursor:not-allowed}
+        .btn:disabled:active{transform:none}
         .spinner{width:28px;height:28px;border:3px solid var(--bd);border-top-color:var(--ac);border-radius:50%;animation:spin .7s linear infinite}
         #loginView{display:flex;align-items:center;justify-content:center;height:100vh;height:100dvh;position:relative;overflow:hidden}
         .loginBg{position:absolute;inset:0;background:radial-gradient(ellipse 70% 50% at 25% 25%,rgba(0,212,170,.07)0%,transparent 60%),radial-gradient(ellipse 50% 60% at 80% 75%,rgba(76,201,240,.05)0%,transparent 60%),var(--bg0)}
@@ -64,6 +66,10 @@
         .bcI:hover{color:var(--ac);background:var(--acd)}
         .bcI.cur{color:var(--t1);cursor:default;font-weight:600}
         .bcI.cur:hover{background:transparent;color:var(--t1)}
+        .bcHome{display:inline-flex;align-items:center;gap:5px}
+        .btnUp{display:none;align-items:center;gap:5px;background:0;border:1px solid var(--bd);color:var(--t2);cursor:pointer;padding:5px 9px;border-radius:6px;font-size:12px;font-family:inherit;transition:var(--tr);flex-shrink:0}
+        .btnUp:hover{color:var(--ac);border-color:var(--ac);background:var(--acd)}
+        .btnUp.show{display:inline-flex}
         .bcS{color:var(--t3);font-size:9px;flex-shrink:0;margin:0 1px}
         .uArea{display:flex;align-items:center;gap:8px;margin-left:auto;flex-shrink:0}
         .uAvt{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--ac),#4cc9f0);display:flex;align-items:center;justify-content:center;font-size:12px;color:#080a0f;font-weight:700}
@@ -109,6 +115,8 @@
         .fGi:hover .gIc{transform:scale(1.1)}
         .fGi .gNm{font-size:12px;font-weight:500;line-height:1.4;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;word-break:break-all;max-width:100%}
         .fGi .gSz{font-size:10px;color:var(--t3);margin-top:4px}
+        .fGi .chk{position:absolute;top:8px;left:8px;opacity:.85;z-index:2}
+        .fGi:hover .chk,.fGi .chk.on{opacity:1}
         .ic-folder{background:rgba(255,190,11,.15);color:#ffc83d}
         .ic-image{background:rgba(232,67,147,.15);color:#f368e0}
         .ic-video{background:rgba(255,107,107,.15);color:#ff7979}
@@ -202,6 +210,8 @@
             .loginCard h1{font-size:20px}
             .cmenu{display:none!important}
             .stBar{display:none}
+            .bcHomeTxt,.upTxt{display:none}
+            .btnUp{padding:6px 8px}
         }
         @media(max-width:400px){
             .loginCard{padding:20px 14px;max-width:96vw;border-radius:12px}
@@ -234,6 +244,7 @@
 <div id="mainView">
     <div class="topbar">
         <div class="brand"><div class="brandI"><i class="fas fa-folder-tree"></i></div><span>{{APP_NAME}}</span></div>
+        <button class="btnUp" id="btnUp" title="返回上一级"><i class="fas fa-arrow-up"></i><span class="upTxt">上一级</span></button>
         <div class="breadcrumb" id="bc"></div>
         <div class="uArea">
             <span class="uNm" id="uNm"></span>
@@ -245,6 +256,8 @@
         <button class="btn btn-p" style="font-size:13px;padding:7px 14px" id="dUp"><i class="fas fa-cloud-arrow-up"></i> 上传</button>
         <button class="btn btn-g" style="font-size:13px;padding:7px 14px" id="dMd"><i class="fas fa-folder-plus"></i> 新建文件夹</button>
         <button class="btn btn-g" style="font-size:13px;padding:7px 14px" id="dRf"><i class="fas fa-arrows-rotate"></i> 刷新</button>
+        <button class="btn btn-g" style="font-size:13px;padding:7px 14px" id="dDl" disabled><i class="fas fa-file-zipper"></i> 下载选中</button>
+        <button class="btn btn-g" style="font-size:13px;padding:7px 14px" id="dSelAll"><i class="fas fa-check-double"></i> 全选</button>
         <div class="vTog"><button id="vL" class="on"><i class="fas fa-list"></i></button><button id="vG"><i class="fas fa-grip"></i></button></div>
         <div class="sBox"><i class="fas fa-search"></i><input id="sD" placeholder="搜索文件..."></div>
     </div>
@@ -282,6 +295,9 @@
     <div class="cmI" data-a="mkdir"><i class="fas fa-folder-plus"></i>新建文件夹</div>
     <div class="cmS"></div>
     <div class="cmI" data-a="refresh"><i class="fas fa-arrows-rotate"></i>刷新</div>
+    <div class="cmS"></div>
+    <div class="cmI" data-a="dlsel"><i class="fas fa-file-zipper"></i>下载选中</div>
+    <div class="cmI" data-a="selall"><i class="fas fa-check-double"></i>全选</div>
 </div>
 
 <div class="asOv" id="asOv">
@@ -381,7 +397,26 @@ var Dav = {
     dl:function(path){
         var self=this;return self._f(self.url(path),{method:'GET',headers:self.ah()}).then(function(r){
             if(r.status>=400)throw new Error('HTTP '+r.status);return r.blob();
-        }).then(function(b){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=U.base(path);document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);});
+        }).then(function(b){self.saveBlob(b,U.base(path));});
+    },
+    saveBlob:function(b,name){var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(a.href);},
+    zip:function(urls,name){
+        var self=this;return new Promise(function(ok,no){
+            var x=new XMLHttpRequest();x.open('POST',self.url('/'),true);
+            var a=self.ah();if(a.Authorization)x.setRequestHeader('Authorization',a.Authorization);
+            x.setRequestHeader('Content-Type','application/json');
+            x.responseType='blob';x.timeout=0;
+            x.onload=function(){
+                if(x.status>=200&&x.status<300){
+                    var fn=name||'download.zip';var cd=x.getResponseHeader('Content-Disposition');
+                    if(cd){var m=cd.match(/filename\*=UTF-8''([^;]+)/i)||cd.match(/filename="([^"]+)"/i);if(m){try{fn=decodeURIComponent(m[1]);}catch(e){fn=m[1];}}}
+                    self.saveBlob(x.response,fn);ok(true);
+                }else no(new Error('HTTP '+x.status));
+            };
+            x.onerror=function(){no(new Error('网络错误'));};
+            x.onabort=function(){no(new Error('已取消'));};
+            x.send(JSON.stringify({paths:urls}));
+        });
     },
     session:function(u,p){
         return fetch(window.location.origin+'/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})}).then(function(r){return r.json();});
@@ -389,7 +424,7 @@ var Dav = {
 };
 
 var A = {
-    path:'/',files:[],sel:{},vm:'list',loading:false,ctx:null,lt:null,lf:false,
+    path:'/',files:[],sel:{},vm:'list',loading:false,ctx:null,lt:null,lf:false,zipBusy:false,
     sortCol:'name',sortDir:1,
 
     toggleSort:function(col){
@@ -442,6 +477,14 @@ var A = {
     selCl:function(){this.sel={};},
     selC:function(){return Object.keys(this.sel).length;},
     selP:function(){return Object.keys(this.sel);},
+    selUI:function(path,on){
+        var els=document.querySelectorAll('#lBody .fRow, #gView .fGi');
+        for(var i=0;i<els.length;i++){if(els[i].dataset.p!==path)continue;els[i].classList.toggle('sel',on);var c=els[i].querySelector('.chk');if(c)c.classList.toggle('on',on);}
+    },
+    selUIall:function(){
+        var self=this;var els=document.querySelectorAll('#lBody .fRow, #gView .fGi');
+        for(var i=0;i<els.length;i++){var on=self.selH(els[i].dataset.p);els[i].classList.toggle('sel',on);var c=els[i].querySelector('.chk');if(c)c.classList.toggle('on',on);}
+    },
 
     login:function(){
         var self=this;
@@ -516,9 +559,10 @@ var A = {
     },
 
     gridH:function(f,i){
-        var ic=U.fico(f.name,f.isDir);var s=this.selH(f.path)?' sel':'';
+        var ic=U.fico(f.name,f.isDir);var s=this.selH(f.path)?' sel':'';var c=this.selH(f.path)?' on':'';
         var delay=Math.min(i*30,300);
         return '<div class="fGi '+ic.tb+s+'" data-p="'+U.esc(f.path)+'" data-d="'+f.isDir+'" data-n="'+U.esc(f.name)+'" style="animation-delay:'+delay+'ms'+(ic.gt?';'+ic.gt:'')+'">'+
+            '<div class="chk'+c+'" data-cp="'+U.esc(f.path)+'"></div>'+
             '<div class="gIc '+ic.cl+'"'+(ic.st?' style="'+ic.st+'"':'')+'><i class="'+ic.ico+'"></i></div>'+
             '<div class="gNm">'+U.esc(f.name)+'</div>'+
             (f.isDir?'':'<div class="gSz">'+U.fmtSz(f.size)+'</div>')+
@@ -527,15 +571,17 @@ var A = {
 
     renderBc:function(){
         var ps=this.path.replace(/\/+$/,'').split('/').filter(Boolean);
-        var h='<span class="bcI" data-bp="/"><i class="fas fa-house" style="font-size:12px"></i></span>';
+        var h='<span class="bcI bcHome" data-bp="/"><i class="fas fa-house" style="font-size:12px"></i><span class="bcHomeTxt">根目录</span></span>';
         var acc='';ps.forEach(function(p,i){acc+='/'+p;var cur=i===ps.length-1;h+='<span class="bcS"><i class="fas fa-chevron-right"></i></span><span class="bcI'+(cur?' cur':'')+'" data-bp="'+U.esc(acc)+'">'+U.esc(p)+'</span>';});
         document.getElementById('bc').innerHTML=h;var bc=document.getElementById('bc');bc.scrollLeft=bc.scrollWidth;
+        document.getElementById('btnUp').classList.toggle('show',ps.length>0);
     },
 
     updSt:function(){
         var t=this.files.length,d=this.files.filter(function(f){return f.isDir;}).length;
         document.getElementById('stI').textContent=t+' 项'+(d>0?'（'+d+' 文件夹，'+(t-d)+' 文件）':'');
         document.getElementById('stS').textContent=this.selC()>0?'已选 '+this.selC()+' 项':'';
+        document.getElementById('dDl').disabled=this.selC()===0;
     },
 
     nav:function(path){this.path=U.lslash(path);document.getElementById('sD').value='';document.getElementById('sM').value='';return this.load();},
@@ -567,7 +613,21 @@ var A = {
     },
 
     dl:function(path){
-        var self=this;return Dav.dl(path).then(function(){self.toast('下载成功: '+U.base(path),'ok');}).catch(function(e){self.toast('下载失败: '+e.message,'er');});
+        var self=this;var f=self.files.find(function(x){return x.path===path;});
+        if(f&&f.isDir)return self.dlSel([path]);
+        return Dav.dl(path).then(function(){self.toast('下载成功: '+U.base(path),'ok');}).catch(function(e){self.toast('下载失败: '+e.message,'er');});
+    },
+
+    dlSel:function(only){
+        var self=this;var ps=only||self.selP();
+        if(!ps.length){self.toast('请先勾选要下载的项目','wn');return;}
+        if(self.zipBusy){self.toast('正在打包中，请稍候','wn');return;}
+        var urls=ps.map(function(p){return Dav.url(p);});
+        var one=ps.length===1?U.base(ps[0].replace(/\/+$/,'')):'';
+        var name=(one?one:'download')+'.zip';
+        var t=self.toast('正在打包 '+ps.length+' 项，请稍候…','in',true);
+        self.zipBusy=true;
+        Dav.zip(urls,name).then(function(){self.toast('打包完成，已开始下载','ok');}).catch(function(e){self.toast('打包失败: '+e.message,'er');}).finally(function(){self.zipBusy=false;t.remove();});
     },
 
     upload:function(fl){
@@ -642,22 +702,25 @@ var A = {
             case'upload':document.getElementById('fInp').click();break;
             case'mkdir':self.startMd();break;
             case'refresh':self.load();break;
-            case'selall':self.files.forEach(function(x){self.selA(x.path);});self.render();self.updSt();break;
+            case'selall':var all=self.files.length>0&&self.files.every(function(x){return self.selH(x.path);});self.files.forEach(function(x){if(all)self.selR(x.path);else self.selA(x.path);});self.selUIall();self.updSt();break;
+            case'dlsel':self.dlSel();break;
             case'delsel':self.confirmDelSel();break;
         }
     },
 
-    toast:function(msg,type){
+    toast:function(msg,type,sticky){
         type=type||'in';var cm={ok:'tOk',er:'tEr',wn:'tWn',in:'tIn'};var im={ok:'fas fa-circle-check',er:'fas fa-circle-xmark',wn:'fas fa-triangle-exclamation',in:'fas fa-circle-info'};
         var el=document.createElement('div');el.className='toast '+(cm[type]||'tIn');el.innerHTML='<span class="tI"><i class="'+(im[type]||im.in)+'"></i></span><span>'+U.esc(msg)+'</span>';
-        document.getElementById('toastC').appendChild(el);setTimeout(function(){el.classList.add('out');setTimeout(function(){el.remove();},300);},3500);
+        document.getElementById('toastC').appendChild(el);
+        if(!sticky)setTimeout(function(){el.classList.add('out');setTimeout(function(){el.remove();},300);},3500);
+        return el;
     },
 
     startLP:function(path,name,isDir){
         var self=this;self.lf=false;self.lt=setTimeout(function(){
             self.lf=true;if(navigator.vibrate)navigator.vibrate(25);self.ctx=path;
             var items=[];
-            if(isDir)items.push({action:'open',icon:'fas fa-folder-open',label:'打开'});
+            if(isDir){items.push({action:'open',icon:'fas fa-folder-open',label:'打开'});items.push({action:'download',icon:'fas fa-file-zipper',label:'打包下载'});}
             else items.push({action:'download',icon:'fas fa-download',label:'下载'});
             items.push({action:'rename',icon:'fas fa-pen',label:'重命名'});
             items.push({action:'copypath',icon:'fas fa-copy',label:'复制路径'});
@@ -678,6 +741,9 @@ var A = {
         document.getElementById('dUp').addEventListener('click',function(){document.getElementById('fInp').click();});
         document.getElementById('dMd').addEventListener('click',function(){self.startMd();});
         document.getElementById('dRf').addEventListener('click',function(){self.load();});
+        document.getElementById('dDl').addEventListener('click',function(){self.dlSel();});
+        document.getElementById('dSelAll').addEventListener('click',function(){self.handleAct('selall');});
+        document.getElementById('btnUp').addEventListener('click',function(){var par=U.dir(self.path);if(par!==self.path)self.nav(par);});
         document.getElementById('vL').addEventListener('click',function(){self.setView('list');});
         document.getElementById('vG').addEventListener('click',function(){self.setView('grid');});
 
@@ -687,6 +753,7 @@ var A = {
         document.getElementById('mVw').addEventListener('click',function(){self.togView();});
         document.getElementById('mMr').addEventListener('click',function(){
             self.ctx=null;var items=[{action:'upload',icon:'fas fa-cloud-arrow-up',label:'上传文件'},{action:'mkdir',icon:'fas fa-folder-plus',label:'新建文件夹'},{action:'refresh',icon:'fas fa-arrows-rotate',label:'刷新'},{sep:true},{action:'selall',icon:'fas fa-check-double',label:'全选'}];
+            if(self.selC()>0)items.push({action:'dlsel',icon:'fas fa-file-zipper',label:'下载选中 ('+self.selC()+')'});
             if(self.selC()>0)items.push({action:'delsel',icon:'fas fa-trash-can',label:'删除选中 ('+self.selC()+')',dg:true});
             self.showSheet('更多操作',items);
         });
@@ -703,8 +770,8 @@ var A = {
 
         fc.addEventListener('click',function(e){
             var ab=e.target.closest('[data-a]');if(ab){e.stopPropagation();var a=ab.dataset.a,p=ab.dataset.p,n=ab.dataset.n;if(a==='dl')self.dl(p);else if(a==='ren')self.startRen(p,n);else if(a==='del')self.confirmDel(p,n);return;}
-            var chk=e.target.closest('.chk');if(chk){var cp=chk.dataset.cp;if(self.selH(cp))self.selR(cp);else self.selA(cp);self.render();self.updSt();return;}
-            var row=e.target.closest('.fRow, .fGi');if(row){if(self.lf){self.lf=false;return;}var path=row.dataset.p,isDir=row.dataset.d==='true';if(e.ctrlKey||e.metaKey){if(self.selH(path))self.selR(path);else self.selA(path);self.render();self.updSt();}else self.open(path,isDir);}
+            var chk=e.target.closest('.chk');if(chk){var cp=chk.dataset.cp;var on=!self.selH(cp);if(on)self.selA(cp);else self.selR(cp);self.selUI(cp,on);self.updSt();return;}
+            var row=e.target.closest('.fRow, .fGi');if(row){if(self.lf){self.lf=false;return;}var path=row.dataset.p,isDir=row.dataset.d==='true';if(e.ctrlKey||e.metaKey){var ron=!self.selH(path);if(ron)self.selA(path);else self.selR(path);self.selUI(path,ron);self.updSt();}else self.open(path,isDir);}
         });
 
         fc.addEventListener('touchstart',function(e){var row=e.target.closest('.fRow, .fGi');if(!row||e.target.closest('.chk'))return;self.startLP(row.dataset.p,row.dataset.n,row.dataset.d==='true');},{passive:true});
@@ -721,7 +788,7 @@ var A = {
         fc.addEventListener('contextmenu',function(e){
             if(U.mob())return;e.preventDefault();
             var row=e.target.closest('.fRow, .fGi');
-            if(row){self.ctx=row.dataset.p;var isDir=row.dataset.d==='true';var m=document.getElementById('cmF');m.querySelector('[data-a="open"]').style.display=isDir?'':'none';m.querySelector('[data-a="download"]').style.display=isDir?'none':'';m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px';m.style.top=Math.min(e.clientY,window.innerHeight-250)+'px';m.classList.add('show');document.getElementById('cmB').classList.remove('show');}
+            if(row){self.ctx=row.dataset.p;var isDir=row.dataset.d==='true';var m=document.getElementById('cmF');m.querySelector('[data-a="open"]').style.display=isDir?'':'none';var dlm=m.querySelector('[data-a="download"]');dlm.style.display='';dlm.innerHTML='<i class="fas fa-'+(isDir?'file-zipper':'download')+'"></i>'+(isDir?'打包下载':'下载');m.style.left=Math.min(e.clientX,window.innerWidth-200)+'px';m.style.top=Math.min(e.clientY,window.innerHeight-250)+'px';m.classList.add('show');document.getElementById('cmB').classList.remove('show');}
             else{var m2=document.getElementById('cmB');m2.style.left=Math.min(e.clientX,window.innerWidth-200)+'px';m2.style.top=Math.min(e.clientY,window.innerHeight-150)+'px';m2.classList.add('show');document.getElementById('cmF').classList.remove('show');}
         });
         document.addEventListener('click',function(e){if(!e.target.closest('.cmenu'))document.querySelectorAll('.cmenu.show').forEach(function(m){m.classList.remove('show');});});

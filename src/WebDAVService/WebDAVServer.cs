@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Text.Json;
@@ -78,6 +79,19 @@ public class WebDAVServer
     {
         "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH"
     };
+
+    // 只有这些方法（真正的 WebDAV 客户端会发的）才回应 401 质询头。
+    private static readonly HashSet<string> ChallengeMethods = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "OPTIONS", "PROPFIND", "PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK"
+    };
+
+    // 浏览器（含 fetch/XHR）收到带 WWW-Authenticate 的 401 会弹原生 Basic 登录框，
+    // 而 WebDAV 客户端必须靠质询头才能认证，所以用 Sec-Fetch-* 区分二者：
+    // 现代浏览器每个请求都带 Sec-Fetch-*，原生 WebDAV 客户端（资源管理器/rclone/Cyberduck/curl…）都不带。
+    private static bool IsBrowserRequest(HttpListenerContext ctx)
+        => ctx.Request.Headers["Sec-Fetch-Mode"] != null
+        || ctx.Request.Headers["Sec-Fetch-Site"] != null;
 
     public WebDAVServer(WebDAVConfig config)
     {
@@ -241,6 +255,13 @@ public class WebDAVServer
                 await HandleLogout(ctx);
                 return;
             }
+            // 浏览器会自动请求 favicon；直接 204，避免它落到 401 分支触发原生认证框
+            if (path == "/favicon.ico")
+            {
+                ctx.Response.StatusCode = 204;
+                ctx.Response.Close();
+                return;
+            }
 
             // SPA: 浏览器 GET 访问目录时直接提供前端 SPA（无需认证，JS 处理所有 WebDAV 请求）
             if (method == "GET" && (ctx.Request.Headers["Accept"] ?? "").Contains("text/html"))
@@ -266,7 +287,11 @@ public class WebDAVServer
                 else
                 {
                     ctx.Response.StatusCode = 401;
-                    ctx.Response.Headers.Add("WWW-Authenticate", "Basic realm=\"WebDAV\"");
+                    // 只对真正的 WebDAV 客户端发质询头；浏览器（含 fetch/XHR）收到会弹原生登录框
+                    var challenged = ChallengeMethods.Contains(method) && !IsBrowserRequest(ctx);
+                    if (challenged)
+                        ctx.Response.Headers.Add("WWW-Authenticate", "Basic realm=\"WebDAV\"");
+                    Log.Information("认证失败: {Method} {Path} (质询: {Challenged})", method, path, challenged);
                 }
                 ctx.Response.Close();
                 return;
@@ -281,6 +306,13 @@ public class WebDAVServer
             }
 
             Log.Debug("{Method} {Path} (user: {User})", method, ctx.Request.Url?.AbsolutePath, username);
+
+            // POST = 打包下载（SPA 专用，body 为 {"paths":["<绝对URL>",...]}）
+            if (method == "POST")
+            {
+                await HandleZipDownloadAsync(ctx);
+                return;
+            }
 
             switch (method)
             {
@@ -597,6 +629,107 @@ public class WebDAVServer
             new XElement(D + "href", href),
             new XElement(D + "propstat", prop, new XElement(D + "status", "HTTP/1.1 200 OK"))
         );
+    }
+
+    // ── 打包下载（POST，SPA 专用） ──
+
+    private async Task HandleZipDownloadAsync(HttpListenerContext ctx)
+    {
+        List<string> urls;
+        try
+        {
+            using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
+            var body = await reader.ReadToEndAsync();
+            using var doc = JsonDocument.Parse(body);
+            urls = doc.RootElement.GetProperty("paths").EnumerateArray()
+                .Select(e => e.GetString() ?? "")
+                .Where(s => s.Length > 0)
+                .ToList();
+        }
+        catch
+        {
+            await SendErrorAsync(ctx.Response, 400, "请求格式错误");
+            return;
+        }
+
+        var targets = new List<(string Full, string Name)>();
+        foreach (var u in urls)
+        {
+            var full = MapPath(GetRelativePathFromUrl(u));
+            if (File.Exists(full)) targets.Add((full, Path.GetFileName(full)));
+            else if (Directory.Exists(full))
+            {
+                var name = new DirectoryInfo(full).Name;
+                targets.Add((full, string.IsNullOrEmpty(name) ? "download" : name));
+            }
+        }
+
+        if (targets.Count == 0)
+        {
+            await SendErrorAsync(ctx.Response, 404, "没有可下载的内容");
+            return;
+        }
+
+        var firstIsDir = Directory.Exists(targets[0].Full);
+        var zipName = targets.Count == 1
+            ? (firstIsDir ? targets[0].Name : Path.GetFileNameWithoutExtension(targets[0].Name)) + ".zip"
+            : "download.zip";
+
+        ctx.Response.StatusCode = 200;
+        ctx.Response.ContentType = "application/zip";
+        ctx.Response.SendChunked = true;
+        ctx.Response.Headers.Add("Content-Disposition",
+            $"attachment; filename=\"{Uri.EscapeDataString(zipName)}\"; filename*=UTF-8''{Uri.EscapeDataString(zipName)}");
+
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            using var zip = new ZipArchive(ctx.Response.OutputStream, ZipArchiveMode.Create, leaveOpen: true);
+            foreach (var (full, name) in targets)
+            {
+                var top = UniqueEntryName(used, name);
+                if (File.Exists(full)) AddFileToZip(zip, full, top);
+                else AddDirectoryToZip(zip, full, top);
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "打包下载失败: {Path}", ctx.Request.Url?.AbsolutePath);
+        }
+        ctx.Response.Close();
+    }
+
+    private static string UniqueEntryName(HashSet<string> used, string name)
+    {
+        if (used.Add(name)) return name;
+        var stem = Path.GetFileNameWithoutExtension(name);
+        var ext = Path.GetExtension(name);
+        for (var i = 2; ; i++)
+        {
+            var candidate = $"{stem} ({i}){ext}";
+            if (used.Add(candidate)) return candidate;
+        }
+    }
+
+    private static void AddFileToZip(ZipArchive zip, string filePath, string entryName)
+    {
+        var entry = zip.CreateEntry(entryName, CompressionLevel.Fastest);
+        using var dst = entry.Open();
+        using var src = File.OpenRead(filePath);
+        src.CopyTo(dst);
+    }
+
+    private static void AddDirectoryToZip(ZipArchive zip, string dirPath, string rootName)
+    {
+        var prefix = rootName + "/";
+        var any = false;
+        foreach (var file in new DirectoryInfo(dirPath).EnumerateFiles("*", SearchOption.AllDirectories))
+        {
+            any = true;
+            var rel = Path.GetRelativePath(dirPath, file.FullName).Replace('\\', '/');
+            AddFileToZip(zip, file.FullName, prefix + rel);
+        }
+        if (!any) zip.CreateEntry(prefix);
     }
 
     // ── GET ──

@@ -18,24 +18,27 @@
 - 自签名 SSL 证书自动生成
 - Windows 防火墙规则配置
 - 安装/卸载为 Windows 服务
+- 内置网页文件管理器：列表/网格视图、搜索、上传、**多选批量打包下载**、图片/视频预览、面包屑「根目录 / 上一级」导航
 
 ## 下载
 
-从 [Releases](https://github.com/anturong/easy_webeav/releases) 下载最新版本，有两种包可选：
+从 [Releases](https://github.com/anturong/easy_webeav/releases) 下载最新版本：
 
 | 包 | 大小 | 说明 |
 |---|---|---|
-| `Easy_WebDAV_v1.1.0_win-x64.zip` | ~67 MB | **自包含版**，已打包 .NET 8 运行时，解压即用，无需额外安装 |
-| `Easy_WebDAV_v1.1.0_win-x64_fd.zip` | ~1.1 MB | **精简版**，需系统已安装 [.NET 8 运行时](https://dotnet.microsoft.com/zh-cn/download/dotnet/8.0) |
+| `Easy_WebDAV_v1.1.1_win-x64.zip` | ~92 MB | **零依赖自包含版**，已内置 .NET 8 运行时，目标机无需安装任何运行时，解压即用 |
 
-解压后以管理员身份运行 `WebDAVConfigurator.exe` 即可。
+解压后目录里只有 `WebDAVService.exe`、`WebDAVConfigurator.exe` 和 `web\` 三项，没有多余的 dll。以管理员身份运行 `WebDAVConfigurator.exe` 即可。
 
 ## 自行编译
 
 ```bash
-dotnet publish src/WebDAVService/WebDAVService.csproj -c Release -r win-x64 -o publish
-dotnet publish src/WebDAVConfigurator/WebDAVConfigurator.csproj -c Release -r win-x64 -o publish
+# 默认即"零依赖自包含单文件"：产物为 2 个 exe + web\，无任何 dll，目标机无需装运行时
+dotnet publish src/WebDAVService/WebDAVService.csproj -c Release -o publish
+dotnet publish src/WebDAVConfigurator/WebDAVConfigurator.csproj -c Release -o publish
 publish/WebDAVConfigurator.exe
+
+# 想要体积更小的"框架依赖"版可加 -p:SelfContained=false（需目标机装 .NET 8 桌面运行时）
 ```
 
 ## 同类工具对比

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
@@ -12,6 +13,7 @@ public class WebDAVServer
     private readonly Dictionary<string, string> _users;
     private readonly Dictionary<string, bool> _readonlyMap;
     private readonly SessionManager _sessions = new();
+    private readonly LoginThrottle _loginThrottle = new();
     private HttpListener? _listener;
     private CancellationTokenSource? _cts;
     private Timer? _healthTimer;
@@ -70,6 +72,61 @@ public class WebDAVServer
             foreach (var kvp in _sessions)
                 if (kvp.Value.CreatedAt < cutoff)
                     _sessions.TryRemove(kvp.Key, out _);
+        }
+    }
+
+    // ── 登录失败限速（防在线爆破） ──
+
+    private class LoginThrottle
+    {
+        private const int MaxFailures = 10;
+        private static readonly TimeSpan Window = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan Lockout = TimeSpan.FromMinutes(15);
+
+        private sealed class Entry { public int Count; public DateTime FirstAt; public DateTime LockedUntil; }
+
+        private readonly Dictionary<string, Entry> _map = new(StringComparer.Ordinal);
+        private readonly object _lock = new();
+
+        public bool IsBlocked(string key)
+        {
+            lock (_lock)
+                return _map.TryGetValue(key, out var e) && e.LockedUntil > DateTime.UtcNow;
+        }
+
+        public void Fail(string key)
+        {
+            lock (_lock)
+            {
+                var now = DateTime.UtcNow;
+                Cleanup(now);
+                if (!_map.TryGetValue(key, out var e) || now - e.FirstAt > Window)
+                {
+                    e = new Entry { FirstAt = now };
+                    _map[key] = e;
+                }
+                if (++e.Count >= MaxFailures)
+                {
+                    Log.Warning("登录失败过多，临时锁定来源 {Key}（{Minutes} 分钟）", key, Lockout.TotalMinutes);
+                    e.LockedUntil = now + Lockout;
+                    e.Count = 0;
+                    e.FirstAt = now;
+                }
+            }
+        }
+
+        public void Success(string key)
+        {
+            lock (_lock) _map.Remove(key);
+        }
+
+        private void Cleanup(DateTime now)
+        {
+            if (_map.Count < 1024) return;
+            foreach (var key in _map
+                         .Where(kv => kv.Value.LockedUntil < now && now - kv.Value.FirstAt > Window)
+                         .Select(kv => kv.Key).ToList())
+                _map.Remove(key);
         }
     }
 
@@ -266,9 +323,8 @@ public class WebDAVServer
             // SPA: 浏览器 GET 访问目录时直接提供前端 SPA（无需认证，JS 处理所有 WebDAV 请求）
             if (method == "GET" && (ctx.Request.Headers["Accept"] ?? "").Contains("text/html"))
             {
-                var relPath = GetRelativePath(path);
-                var fullPath = MapPath(relPath);
-                if (Directory.Exists(fullPath))
+                var fullPath = MapPath(GetRelativePath(path));
+                if (fullPath != null && Directory.Exists(fullPath))
                 {
                     await SendBrowsePage(ctx);
                     return;
@@ -383,6 +439,13 @@ public class WebDAVServer
         if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
             return false;
 
+        var clientKey = ClientKey(ctx);
+        if (_loginThrottle.IsBlocked(clientKey))
+        {
+            Log.Warning("来源已被限速，拒绝认证: {Key} ({Path})", clientKey, ctx.Request.Url?.AbsolutePath);
+            return false;
+        }
+
         try
         {
             var encoded = authHeader.Substring(6).Trim();
@@ -394,9 +457,11 @@ public class WebDAVServer
 
             if (_users.TryGetValue(user, out var expectedPass) && expectedPass == pass)
             {
+                _loginThrottle.Success(clientKey);
                 username = user;
                 return true;
             }
+            _loginThrottle.Fail(clientKey);
         }
         catch { }
         return false;
@@ -429,12 +494,26 @@ public class WebDAVServer
                     var jsonUser = json.RootElement.GetProperty("username").GetString() ?? "";
                     var jsonPass = json.RootElement.GetProperty("password").GetString() ?? "";
 
+                    var clientKey = ClientKey(ctx);
+                    if (_loginThrottle.IsBlocked(clientKey))
+                    {
+                        var blkBytes = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"尝试次数过多，请稍后再试\"}");
+                        ctx.Response.StatusCode = 429;
+                        ctx.Response.ContentType = "application/json; charset=utf-8";
+                        ctx.Response.ContentLength64 = blkBytes.Length;
+                        await ctx.Response.OutputStream.WriteAsync(blkBytes);
+                        ctx.Response.Close();
+                        return;
+                    }
+
                     if (_users.TryGetValue(jsonUser, out var jsonExpected) && jsonExpected == jsonPass)
                     {
+                        _loginThrottle.Success(clientKey);
                         var token = _sessions.Create(jsonUser);
                         ctx.Response.SetCookie(new Cookie("session", token)
                         {
                             HttpOnly = true,
+                            Secure = ctx.Request.IsSecureConnection,
                             Path = "/",
                             Expires = DateTime.UtcNow.AddDays(1)
                         });
@@ -445,6 +524,7 @@ public class WebDAVServer
                     }
                     else
                     {
+                        _loginThrottle.Fail(clientKey);
                         var errBytes = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"用户名或密码错误\"}");
                         ctx.Response.ContentType = "application/json; charset=utf-8";
                         ctx.Response.ContentLength64 = errBytes.Length;
@@ -469,12 +549,21 @@ public class WebDAVServer
             var user = parsed.GetValueOrDefault("username", "");
             var pass = parsed.GetValueOrDefault("password", "");
 
+            var formKey = ClientKey(ctx);
+            if (_loginThrottle.IsBlocked(formKey))
+            {
+                await SendLoginPage(ctx, true);
+                return;
+            }
+
             if (_users.TryGetValue(user, out var expected) && expected == pass)
             {
+                _loginThrottle.Success(formKey);
                 var token = _sessions.Create(user);
                 ctx.Response.SetCookie(new Cookie("session", token)
                 {
                     HttpOnly = true,
+                    Secure = ctx.Request.IsSecureConnection,
                     Path = "/",
                     Expires = DateTime.UtcNow.AddDays(1)
                 });
@@ -484,6 +573,7 @@ public class WebDAVServer
                 return;
             }
 
+            _loginThrottle.Fail(formKey);
             await SendLoginPage(ctx, true);
             return;
         }
@@ -558,7 +648,8 @@ public class WebDAVServer
     private async Task HandlePropFindAsync(HttpListenerContext ctx)
     {
         var relPath = GetRelativePath(ctx.Request.Url!.AbsolutePath);
-        var fullPath = MapPath(relPath);
+        var fullPath = MapOr403(ctx, relPath);
+        if (fullPath == null) return;
         var depth = ctx.Request.Headers["Depth"] ?? "1";
 
         if (!Directory.Exists(fullPath) && !File.Exists(fullPath))
@@ -655,7 +746,8 @@ public class WebDAVServer
         var targets = new List<(string Full, string Name)>();
         foreach (var u in urls)
         {
-            var full = MapPath(GetRelativePathFromUrl(u));
+            var full = MapOr403(ctx, GetRelativePathFromUrl(u));
+            if (full == null) return;
             if (File.Exists(full)) targets.Add((full, Path.GetFileName(full)));
             else if (Directory.Exists(full))
             {
@@ -736,8 +828,8 @@ public class WebDAVServer
 
     private async Task HandleGetAsync(HttpListenerContext ctx)
     {
-        var relPath = GetRelativePath(ctx.Request.Url!.AbsolutePath);
-        var fullPath = MapPath(relPath);
+        var fullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (fullPath == null) return;
 
         if (Directory.Exists(fullPath))
         {
@@ -766,8 +858,8 @@ public class WebDAVServer
 
     private void HandleHead(HttpListenerContext ctx)
     {
-        var relPath = GetRelativePath(ctx.Request.Url!.AbsolutePath);
-        var fullPath = MapPath(relPath);
+        var fullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (fullPath == null) return;
 
         if (!File.Exists(fullPath))
         {
@@ -788,8 +880,8 @@ public class WebDAVServer
 
     private async Task HandlePutAsync(HttpListenerContext ctx)
     {
-        var relPath = GetRelativePath(ctx.Request.Url!.AbsolutePath);
-        var fullPath = MapPath(relPath);
+        var fullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (fullPath == null) return;
         var parentDir = Path.GetDirectoryName(fullPath)!;
         if (!Directory.Exists(parentDir)) Directory.CreateDirectory(parentDir);
 
@@ -812,8 +904,8 @@ public class WebDAVServer
 
     private async Task HandleDeleteAsync(HttpListenerContext ctx)
     {
-        var relPath = GetRelativePath(ctx.Request.Url!.AbsolutePath);
-        var fullPath = MapPath(relPath);
+        var fullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (fullPath == null) return;
 
         try
         {
@@ -832,8 +924,8 @@ public class WebDAVServer
 
     private void HandleMkCol(HttpListenerContext ctx)
     {
-        var relPath = GetRelativePath(ctx.Request.Url!.AbsolutePath);
-        var fullPath = MapPath(relPath);
+        var fullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (fullPath == null) return;
 
         if (Directory.Exists(fullPath)) ctx.Response.StatusCode = 405;
         else
@@ -851,8 +943,10 @@ public class WebDAVServer
         var destHeader = ctx.Request.Headers["Destination"];
         if (string.IsNullOrEmpty(destHeader)) { ctx.Response.StatusCode = 400; ctx.Response.Close(); return; }
 
-        var srcFullPath = MapPath(GetRelativePath(ctx.Request.Url!.AbsolutePath));
-        var destFullPath = MapPath(GetRelativePathFromUrl(destHeader));
+        var srcFullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (srcFullPath == null) return;
+        var destFullPath = MapOr403(ctx, GetRelativePathFromUrl(destHeader));
+        if (destFullPath == null) return;
         var overwrite = !string.Equals(ctx.Request.Headers["Overwrite"], "F", StringComparison.OrdinalIgnoreCase);
 
         try
@@ -882,8 +976,10 @@ public class WebDAVServer
         var destHeader = ctx.Request.Headers["Destination"];
         if (string.IsNullOrEmpty(destHeader)) { ctx.Response.StatusCode = 400; ctx.Response.Close(); return; }
 
-        var srcFullPath = MapPath(GetRelativePath(ctx.Request.Url!.AbsolutePath));
-        var destFullPath = MapPath(GetRelativePathFromUrl(destHeader));
+        var srcFullPath = MapOr403(ctx, GetRelativePath(ctx.Request.Url!.AbsolutePath));
+        if (srcFullPath == null) return;
+        var destFullPath = MapOr403(ctx, GetRelativePathFromUrl(destHeader));
+        if (destFullPath == null) return;
 
         try
         {
@@ -963,8 +1059,49 @@ public class WebDAVServer
         catch { return fullUrl.TrimStart('/'); }
     }
 
-    private string MapPath(string relativePath)
-        => Path.GetFullPath(Path.Combine(_config.RootDir, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+    private string? MapPath(string relativePath)
+    {
+        try
+        {
+            // Path.Combine 遇到「有根」的第二段会直接返回它，故先挡掉盘符/绝对路径/UNC
+            if (Path.IsPathRooted(relativePath)) return null;
+
+            var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_config.RootDir));
+            var combined = Path.GetFullPath(
+                Path.Combine(root, relativePath.Replace('/', Path.DirectorySeparatorChar)));
+
+            // 规范化后必须仍在共享根之下，否则视为目录穿越
+            return combined.Equals(root, StringComparison.OrdinalIgnoreCase)
+                || combined.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    ? combined
+                    : null;
+        }
+        catch { return null; }
+    }
+
+    /// <summary>映射相对路径；越界则回 403 并返回 null（调用方应 return）。</summary>
+    private string? MapOr403(HttpListenerContext ctx, string relativePath)
+    {
+        var full = MapPath(relativePath);
+        if (full == null)
+        {
+            Log.Warning("拒绝越界路径请求: {Method} {Path}", ctx.Request.HttpMethod, ctx.Request.Url?.AbsolutePath);
+            ctx.Response.StatusCode = 403;
+            ctx.Response.Close();
+        }
+        return full;
+    }
+
+    /// <summary>限速键：IPv4 用整地址；IPv6 收敛到 /64，防止在 /64 内轮换地址绕过限速。</summary>
+    private static string ClientKey(HttpListenerContext ctx)
+    {
+        var ip = ctx.Request.RemoteEndPoint?.Address;
+        if (ip == null) return "unknown";
+        if (ip.IsIPv4MappedToIPv6) ip = ip.MapToIPv4();
+        if (ip.AddressFamily == AddressFamily.InterNetworkV6)
+            return "v6:" + Convert.ToHexString(ip.GetAddressBytes(), 0, 8);
+        return "v4:" + ip;
+    }
 
     private static async Task SendErrorAsync(HttpListenerResponse response, int statusCode, string message)
     {

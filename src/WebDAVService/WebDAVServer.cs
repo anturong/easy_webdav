@@ -150,6 +150,10 @@ public class WebDAVServer
         => ctx.Request.Headers["Sec-Fetch-Mode"] != null
         || ctx.Request.Headers["Sec-Fetch-Site"] != null;
 
+    // 请求体上限：登录（JSON/表单）与打包下载各自限制，避免无界读取撑爆内存。
+    private const int MaxLoginBodyBytes = 64 * 1024;
+    private const int MaxZipBodyBytes = 1024 * 1024;
+
     public WebDAVServer(WebDAVConfig config)
     {
         _config = config;
@@ -320,11 +324,13 @@ public class WebDAVServer
                 return;
             }
 
-            // SPA: 浏览器 GET 访问目录时直接提供前端 SPA（无需认证，JS 处理所有 WebDAV 请求）
+            // SPA: 浏览器 GET 时提供前端 SPA（JS 自己处理所有 WebDAV 请求）。
+            // 根路径无条件提供（登录入口）；其他路径仅在已持有会话、且目标是目录时提供，
+            // 未认证一律落到下面的鉴权分支——否则未认证客户端可借 200/401 的差异探测目录是否存在。
             if (method == "GET" && (ctx.Request.Headers["Accept"] ?? "").Contains("text/html"))
             {
                 var fullPath = MapPath(GetRelativePath(path));
-                if (fullPath != null && Directory.Exists(fullPath))
+                if (path == "/" || (fullPath != null && Directory.Exists(fullPath) && GetSessionUser(ctx) != null))
                 {
                     await SendBrowsePage(ctx);
                     return;
@@ -486,8 +492,27 @@ public class WebDAVServer
             // JSON 请求（来自 SPA）
             if ((ctx.Request.ContentType ?? "").StartsWith("application/json", StringComparison.OrdinalIgnoreCase))
             {
-                using var jsonReader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-                var jsonBody = await jsonReader.ReadToEndAsync();
+                if (ctx.Request.ContentLength64 > MaxLoginBodyBytes)
+                {
+                    var bigBytes = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"请求体过大\"}");
+                    ctx.Response.StatusCode = 413;
+                    ctx.Response.ContentType = "application/json; charset=utf-8";
+                    ctx.Response.ContentLength64 = bigBytes.Length;
+                    await ctx.Response.OutputStream.WriteAsync(bigBytes);
+                    ctx.Response.Close();
+                    return;
+                }
+                var jsonBody = await ReadBodyLimitedAsync(ctx.Request.InputStream, MaxLoginBodyBytes);
+                if (jsonBody == null)
+                {
+                    var bigBytes = Encoding.UTF8.GetBytes("{\"ok\":false,\"error\":\"请求体过大\"}");
+                    ctx.Response.StatusCode = 413;
+                    ctx.Response.ContentType = "application/json; charset=utf-8";
+                    ctx.Response.ContentLength64 = bigBytes.Length;
+                    await ctx.Response.OutputStream.WriteAsync(bigBytes);
+                    ctx.Response.Close();
+                    return;
+                }
                 try
                 {
                     var json = JsonDocument.Parse(jsonBody);
@@ -510,13 +535,7 @@ public class WebDAVServer
                     {
                         _loginThrottle.Success(clientKey);
                         var token = _sessions.Create(jsonUser);
-                        ctx.Response.SetCookie(new Cookie("session", token)
-                        {
-                            HttpOnly = true,
-                            Secure = ctx.Request.IsSecureConnection,
-                            Path = "/",
-                            Expires = DateTime.UtcNow.AddDays(1)
-                        });
+                        SetSessionCookie(ctx, token);
                         var okBytes = Encoding.UTF8.GetBytes("{\"ok\":true}");
                         ctx.Response.ContentType = "application/json; charset=utf-8";
                         ctx.Response.ContentLength64 = okBytes.Length;
@@ -543,8 +562,17 @@ public class WebDAVServer
             }
 
             // 表单 POST（浏览器传统登录）
-            using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-            var body = await reader.ReadToEndAsync();
+            if (ctx.Request.ContentLength64 > MaxLoginBodyBytes)
+            {
+                await SendErrorAsync(ctx.Response, 413, "请求体过大");
+                return;
+            }
+            var body = await ReadBodyLimitedAsync(ctx.Request.InputStream, MaxLoginBodyBytes);
+            if (body == null)
+            {
+                await SendErrorAsync(ctx.Response, 413, "请求体过大");
+                return;
+            }
             var parsed = ParseFormBody(body);
             var user = parsed.GetValueOrDefault("username", "");
             var pass = parsed.GetValueOrDefault("password", "");
@@ -560,13 +588,7 @@ public class WebDAVServer
             {
                 _loginThrottle.Success(formKey);
                 var token = _sessions.Create(user);
-                ctx.Response.SetCookie(new Cookie("session", token)
-                {
-                    HttpOnly = true,
-                    Secure = ctx.Request.IsSecureConnection,
-                    Path = "/",
-                    Expires = DateTime.UtcNow.AddDays(1)
-                });
+                SetSessionCookie(ctx, token);
                 ctx.Response.StatusCode = 302;
                 ctx.Response.Headers.Add("Location", "/");
                 ctx.Response.Close();
@@ -729,8 +751,17 @@ public class WebDAVServer
         List<string> urls;
         try
         {
-            using var reader = new StreamReader(ctx.Request.InputStream, Encoding.UTF8);
-            var body = await reader.ReadToEndAsync();
+            if (ctx.Request.ContentLength64 > MaxZipBodyBytes)
+            {
+                await SendErrorAsync(ctx.Response, 413, "请求体过大");
+                return;
+            }
+            var body = await ReadBodyLimitedAsync(ctx.Request.InputStream, MaxZipBodyBytes);
+            if (body == null)
+            {
+                await SendErrorAsync(ctx.Response, 413, "请求体过大");
+                return;
+            }
             using var doc = JsonDocument.Parse(body);
             urls = doc.RootElement.GetProperty("paths").EnumerateArray()
                 .Select(e => e.GetString() ?? "")
@@ -958,7 +989,17 @@ public class WebDAVServer
                 File.Copy(srcFullPath, destFullPath, overwrite);
             }
             else if (Directory.Exists(srcFullPath))
+            {
+                // 目标若落在源目录内部，CopyDirectory 会把刚建出的目标再当子目录递归下去，
+                // 直到 StackOverflowException 打崩进程（.NET 中不可捕获）。先拒绝。
+                if (IsSameOrUnder(destFullPath, srcFullPath))
+                {
+                    ctx.Response.StatusCode = 409;   // Conflict
+                    ctx.Response.Close();
+                    return;
+                }
                 CopyDirectory(srcFullPath, destFullPath, overwrite);
+            }
             else { ctx.Response.StatusCode = 404; ctx.Response.Close(); return; }
 
             ctx.Response.StatusCode = overwrite ? 204 : 201;
@@ -1103,6 +1144,30 @@ public class WebDAVServer
         return "v4:" + ip;
     }
 
+    /// <summary>写入会话 Cookie：HttpOnly + SameSite=Lax，HTTPS 下追加 Secure。
+    /// 手工拼 Set-Cookie，因为 HttpListener 不序列化 Cookie.SameSite。token 为 32 位十六进制，无需转义。</summary>
+    private static void SetSessionCookie(HttpListenerContext ctx, string token)
+    {
+        var secure = ctx.Request.IsSecureConnection ? "; Secure" : "";
+        var expires = DateTime.UtcNow.AddDays(1).ToString("R");
+        ctx.Response.AppendHeader("Set-Cookie",
+            $"session={token}; Path=/; HttpOnly; SameSite=Lax{secure}; Expires={expires}");
+    }
+
+    /// <summary>限长读取请求体（按 UTF-8 解码）；超过 maxBytes 返回 null。防止无界读取耗尽内存。</summary>
+    private static async Task<string?> ReadBodyLimitedAsync(Stream input, int maxBytes)
+    {
+        using var ms = new MemoryStream();
+        var buf = new byte[8192];
+        int n;
+        while ((n = await input.ReadAsync(buf).ConfigureAwait(false)) > 0)
+        {
+            if (ms.Length + n > maxBytes) return null;
+            ms.Write(buf, 0, n);
+        }
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
     private static async Task SendErrorAsync(HttpListenerResponse response, int statusCode, string message)
     {
         var body = Encoding.UTF8.GetBytes($"{statusCode} - {message}");
@@ -1145,6 +1210,15 @@ public class WebDAVServer
             File.Copy(file, Path.Combine(destDir, Path.GetFileName(file)), overwrite);
         foreach (var dir in Directory.GetDirectories(srcDir))
             CopyDirectory(dir, Path.Combine(destDir, Path.GetFileName(dir)!), overwrite);
+    }
+
+    /// <summary>candidate 是否等于 ancestor 或位于其下（按规范化后的全路径比较）。</summary>
+    private static bool IsSameOrUnder(string candidate, string ancestor)
+    {
+        var a = Path.TrimEndingDirectorySeparator(Path.GetFullPath(ancestor));
+        var c = Path.TrimEndingDirectorySeparator(Path.GetFullPath(candidate));
+        return c.Equals(a, StringComparison.OrdinalIgnoreCase)
+            || c.StartsWith(a + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string GetMimeType(string fileName) => Path.GetExtension(fileName).ToLowerInvariant() switch

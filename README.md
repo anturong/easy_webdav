@@ -22,7 +22,7 @@
 
 ## 下载
 
-从 [Releases](https://github.com/anturong/easy_webeav/releases) 下载最新版本：
+从 [Releases](https://github.com/anturong/easy_webdav/releases) 下载最新版本：
 
 | 包 | 大小 | 说明 |
 |---|---|---|

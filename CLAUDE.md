@@ -41,14 +41,14 @@ curl -s -x socks5://127.0.0.1:3067 \
   -H "Authorization: token $(git credential-manager get <<< 'protocol=https\nhost=github.com' | grep password | head -1 | cut -d= -f2)" \
   -H "Content-Type: application/json" \
   -d @release_body.json \
-  https://api.github.com/repos/anturong/easy_webeav/releases
+  https://api.github.com/repos/anturong/easy_webdav/releases
 
 # Upload asset
 curl -s -x socks5://127.0.0.1:3067 \
   -H "Authorization: token $(...)" \
   -H "Content-Type: application/zip" \
   --data-binary @Easy_WebDAV_v{version}_win-x64.zip \
-  "https://uploads.github.com/repos/anturong/easy_webeav/releases/{release_id}/assets?name=Easy_WebDAV_v{version}_win-x64.zip"
+  "https://uploads.github.com/repos/anturong/easy_webdav/releases/{release_id}/assets?name=Easy_WebDAV_v{version}_win-x64.zip"
 ```
 
 ## Architecture

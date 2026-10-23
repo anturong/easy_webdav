@@ -26,7 +26,7 @@
 
 | 包 | 大小 | 说明 |
 |---|---|---|
-| `Easy_WebDAV_v1.2.1_win-x64.zip` | ~92 MB | **零依赖自包含版**，已内置 .NET 8 运行时，目标机无需安装任何运行时，解压即用 |
+| `Easy_WebDAV_v1.2.2_win-x64.zip` | ~92 MB | **零依赖自包含版**，已内置 .NET 8 运行时，目标机无需安装任何运行时，解压即用 |
 
 解压后目录里只有 `WebDAVService.exe`、`WebDAVConfigurator.exe` 和 `web\` 三项，没有多余的 dll。以管理员身份运行 `WebDAVConfigurator.exe` 即可。
 
@@ -55,6 +55,13 @@ publish/WebDAVConfigurator.exe
 本工具的优势在于：**Windows 原生 .NET 开发、零外部依赖、WPF 图形配置界面、一键安装服务**，适合快速在 Windows 上搭建 WebDAV 服务。劣势是试验性质，未经安全审计，不适合生产环境。
 
 ## 更新日志
+
+### v1.2.2
+
+- 防火墙规则改为按用户设置管理：安装/重装服务时只为已启用的 HTTP/HTTPS 端口放行，未启用端口的规则自动清理。
+- HTTP 与 HTTPS 使用独立规则（`WebDAV Service (HTTP)` / `WebDAV Service (HTTPS)`），修改端口后旧规则被删除并按新端口重建。
+- 卸载服务时移除全部防火墙规则。
+- 自动清理旧版 `WebDAV Service` 规则，规则操作记录到 `logs/firewall.log`。
 
 ### v1.2.1
 

@@ -30,7 +30,37 @@ public class ServiceHelper
         RunSc($"description {ServiceName} \"WebDAV 文件共享服务\"");
         RunSc($"failure {ServiceName} reset= 86400 actions= restart/5000/restart/5000/restart/5000");
 
+        ApplyFirewallRules();
         StartService();
+    }
+
+    private static void ApplyFirewallRules()
+    {
+        var configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "webdav_config.json");
+        if (!File.Exists(configPath)) return;
+        try
+        {
+            var config = WebDAVConfigData.Load();
+            WriteFirewallLog(FirewallHelper.EnsureRules(config));
+        }
+        catch (Exception ex)
+        {
+            WriteFirewallLog(new List<(bool, string)> { (false, $"防火墙规则配置异常: {ex.Message}") });
+        }
+    }
+
+    private static void WriteFirewallLog(List<(bool success, string message)> results)
+    {
+        if (results.Count == 0) return;
+        try
+        {
+            var dir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "logs");
+            Directory.CreateDirectory(dir);
+            var lines = results.Select(r =>
+                $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {(r.success ? "OK" : "FAIL")} {r.message}");
+            File.AppendAllLines(Path.Combine(dir, "firewall.log"), lines);
+        }
+        catch { }
     }
 
     public void UninstallService()
@@ -55,6 +85,8 @@ public class ServiceHelper
         StopService();
         Thread.Sleep(3000);
         DeleteService();
+
+        WriteFirewallLog(FirewallHelper.RemoveRules());
     }
 
     public void RestartService()

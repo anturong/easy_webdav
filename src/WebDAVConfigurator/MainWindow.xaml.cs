@@ -218,23 +218,15 @@ namespace WebDAVConfigurator
 
                 if (Program.IsRunningAsAdmin())
                 {
-                    if (_config.EnableHttp)
-                    {
-                        var (ok, msg) = FirewallHelper.EnsureFirewallRule(_config.Port);
+                    foreach (var (ok, msg) in FirewallHelper.EnsureRules(_config))
                         Log(msg, ok ? "Green" : "Red");
-                    }
-                    if (_config.EnableHttps)
-                    {
-                        var (ok2, msg2) = FirewallHelper.EnsureFirewallRule(_config.HttpsPort);
-                        Log(msg2, ok2 ? "Green" : "Red");
-                    }
                 }
                 else
                 {
                     var ports = new List<int>();
                     if (_config.EnableHttp) ports.Add(_config.Port);
                     if (_config.EnableHttps) ports.Add(_config.HttpsPort);
-                    Log($"防火墙规则需管理员权限，安装服务时会自动处理端口 {string.Join("/", ports)}", "Yellow");
+                    Log($"防火墙规则需管理员权限，安装服务时会自动放行端口 {string.Join("/", ports)}", "Yellow");
                 }
 
                 System.Windows.MessageBox.Show("配置已保存！\n请重启服务使配置生效。", "成功");
